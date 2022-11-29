@@ -111,6 +111,7 @@ public class JWTFilter extends GenericFilterBean {
                 Map<String, String> map= new HashMap<>();
                 map.put("grant_type", "authorization_code");
                 map.put("client_id", "oauth2-demo");
+                map.put("client_secret", "xxxxxxxxxxxxxxxxxxxxxxxx");
                 map.put("code", authorizationCode);
                 map.put("response_type", "token");
                 map.put("redirect_uri", "http://localhost:8080/");
@@ -127,8 +128,32 @@ public class JWTFilter extends GenericFilterBean {
 
                 HttpEntity<String> request = new HttpEntity<>(form, headers);
                 System.out.println("Request headers: " + request.getHeaders().toString());
-                ResponseEntity<String> result = restTemplate.exchange(URI.create(tokenUrl), HttpMethod.POST, request, String.class);
-                System.out.println("TOken result body: " + result.getBody());
+                ResponseEntity<AccessToken> result = restTemplate.exchange(URI.create(tokenUrl), HttpMethod.POST, request, AccessToken.class);
+                System.out.println("TOken result body: " + result.getBody() + ", token: " + result.getBody().getAccessToken());
+                String accessToken = result.getBody().getAccessToken();
+
+                System.out.println("DEBUG: validating token with introspection ...");
+
+                map = new HashMap<>();
+                map.put("token_type_hint", "access_token");
+                map.put("token", accessToken);
+
+                form = map
+                    .entrySet()
+                    .stream()
+                    .map(entry -> String.join("=",
+                            URLEncoder.encode((String)entry.getKey(), StandardCharsets.UTF_8),
+                            URLEncoder.encode((String)entry.getValue(), StandardCharsets.UTF_8)))
+                    .collect(Collectors.joining("&"));
+
+                String credentials = "oauth2-demo:xxxxxxxxxxxx";
+                byte[] credentialBytes = credentials.getBytes();
+                byte[] base64CredentialBytes = Base64.getEncoder().encode(credentialBytes);
+                String base64Credentials = new String(base64CredentialBytes);
+                headers.add("Authorization", "Basic " + base64Credentials);
+                request = new HttpEntity<>(form, headers);
+                ResponseEntity<String> introspect_result = restTemplate.exchange(URI.create(introspectUrl), HttpMethod.POST, request, String.class);
+                System.out.println("Introspect result body : " + introspect_result.getBody())
 
             }
 
