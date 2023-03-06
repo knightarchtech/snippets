@@ -1,0 +1,141 @@
+Storage
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${JENKINS_AGENT_NAME}-storage
+  namespace: jenkins
+  labels:
+    app.kubernetes.io/instance: ${JENKINS_AGENT_NAME}
+    app.kubernetes.io/name: ${JENKINS_AGENT_NAME}
+  finalizers:
+  - kubernetes.io/pvc-protection  
+spec:
+  storageClassName: nfs-client
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+      
+Deployment:
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ${JENKINS_AGENT_NAME}
+  namespace: jenkins
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ${JENKINS_AGENT_NAME}
+  template:
+    metadata:
+      labels:
+        app: ${JENKINS_AGENT_NAME}
+    spec:
+      serviceAccountName: jenkins-admin
+      securityContext:
+        fsGroup: 1000
+        runAsUser: 1000
+      containers:
+      - env:
+        - name: "JENKINS_SECRET"
+          valueFrom:
+            configMapKeyRef:
+              name: ${JENKINS_AGENT_NAME}-config
+              key: jnlp-secret
+        - name: "JENKINS_TUNNEL"
+          value: "jenkins-service:50000"
+        - name: "JENKINS_AGENT_NAME"
+          value: ${JENKINS_AGENT_NAME}
+        - name: "JENKINS_AGENT_WORKDIR"
+          value: "/home/jenkins/agent"
+        - name: "JENKINS_URL"
+          value: "http://jenkins-service:8080/jenkins"
+        image: "jenkins/agent:latest"
+        imagePullPolicy: "Always"
+        name: "jenkins-agent"
+        command:
+          - "/bin/sh"
+          - "-c"
+          - "(curl -sO http://jenkins-service:8080/jnlpJars/agent.jar; java -jar agent.jar -jnlpUrl http://jenkins-service:8080/manage/computer/${JENKINS_AGENT_NAME}/jenkins-agent.jnlp -secret $JENKINS_SECRET)"
+        resources:
+          limits:
+            cpu: "2000m"
+            memory: "2048Mi"
+          requests:
+            cpu: "500m"
+            memory: "1024Mi"
+        volumeMounts:
+        - mountPath: "/home/jenkins/agent"
+          name: ${JENKINS_AGENT_NAME}-vol
+          readOnly: false
+      volumes:
+        - name: ${JENKINS_AGENT_NAME}-vol
+          persistentVolumeClaim:
+              claimName: ${JENKINS_AGENT_NAME}-storage
+
+Deploy script
+##################
+#!/bin/bash
+
+if [ $# -lt 4 ]; then
+    echo "Usage $0 <jenkins_server_url> <jenkins_agent_name> <jenkins_username> <jenkins_password>"
+    exit 1
+fi
+JENKINS_SERVER_URL=$1 
+JENKINS_AGENT_NAME=$2 
+JENKINS_USERNAME=$3
+JENKINS_PASSWORD=$4
+
+# kubectl command
+KUBECTL_CMD="kubectl --insecure-skip-tls-verify"
+
+# checking if Java is installed
+java -version > /dev/null 2>&1
+if [ $? -ne -0 ]; then
+    echo "Java is not installed. Install JDK or specify path to Java binary in PATH"
+    exit 1
+fi
+
+echo "Downloading Jenkins CLI ..."
+curl -o jenkins-cli.jar ${JENKINS_SERVER_URL}/jnlpJars/jenkins-cli.jar
+
+echo "Verifying that Jenkins CLI works ..."
+curl -s -L --user ${JENKINS_USERNAME}:${JENKINS_PASSWORD} -H "Content-type: text/json" ${JENKINS_SERVER_URL}/api/json?pretty=true
+
+echo "Creating a Jenkins JNLP inboud node agent"
+cat <<EOF | java -jar jenkins-cli.jar -auth ${JENKINS_USERNAME}:${JENKINS_PASSWORD} -s ${JENKINS_SERVER_URL} create-node ${JENKINS_AGENT_NAME}
+<slave>
+  <remoteFS>/home/jenkins/agent</remoteFS>
+  <numExecutors>2</numExecutors>
+  <launcher class="hudson.slaves.JNLPLauncher" />
+</slave>
+EOF
+
+echo "Getting Jenkins JNLP secret string ..."
+JNLP_SECRET=`curl -s -L \
+    --user ${JENKINS_USERNAME}:${JENKINS_PASSWORD} \
+    -H "Content-type: text/json" \
+    ${JENKINS_SERVER_URL}/manage/computer/${JENKINS_AGENT_NAME}/ 2>&1 \
+    | grep jnlpUrl \
+    | grep -v "@secret-file" \
+    | awk -F "-secret " {'print $2'} \
+    | awk -F " </pre>" {'print $1'}`
+
+echo "Creating configmap for Jenkins agent ..."
+${KUBECTL_CMD} -n jenkins \
+    create configmap ${JENKINS_AGENT_NAME}-config \
+    --from-literal jenkins-server-url="${JENKINS_SERVER_URL}/jenkins" \
+    --from-literal jenkins-agent-name=${JENKINS_AGENT_NAME} \
+    --from-literal jnlp-secret=${JNLP_SECRET} \
+    -o yaml \
+    --dry-run=client | ${KUBECTL_CMD} apply -f -
+
+
+export JENKINS_AGENT_NAME
+export JENKINS_SECRET=${JNLP_SECRET}
+cat ./agent/templates/storage.yaml | envsubst | ${KUBECTL_CMD} -n jenkins apply -f -
+cat ./agent/templates/deployment.yaml | envsubst | ${KUBECTL_CMD} -n jenkins apply -f -
